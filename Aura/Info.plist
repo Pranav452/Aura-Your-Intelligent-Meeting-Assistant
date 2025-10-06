@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleURLTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleTypeRole</key>
+			<string>Editor</string>
+			<key>CFBundleURLName</key>
+			<string></string>
+			<key>CFBundleURLSchemes</key>
+			<array>
+				<string>io.supabase.aura</string>
+			</array>
+		</dict>
+		<dict/>
+	</array>
+	<key>Privacy - Screen Capture Usage Description</key>
+	<string>Aura needs screen recording access to capture the audio from other participants in your online meetings.</string>
+</dict>
+</plist>
