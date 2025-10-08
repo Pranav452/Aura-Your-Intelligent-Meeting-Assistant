@@ -1,3 +1,5 @@
+// CaptureManager.swift
+
 import Foundation
 import AVFoundation
 import ScreenCaptureKit
@@ -22,11 +24,16 @@ class CaptureManager: NSObject, ObservableObject, SCStreamDelegate, SCStreamOutp
     private var micAudioEngine: AVAudioEngine?
     private var stream: SCStream?
     private var availableContent: SCShareableContent?
-    private var assetWriter: AVAssetWriter?
-    private var micAudioInput: AVAssetWriterInput?
-    private var systemAudioInput: AVAssetWriterInput?
-    private var sessionStartTime: CMTime?
-    private var lastOutputFileURL: URL?
+    
+    // URLs for the two temporary raw audio files
+    private var tempMicURL: URL?
+    private var tempSystemURL: URL?
+    private var finalOutputURL: URL?
+    
+    // AVAudioFile objects to write the raw audio
+    private var micAudioFile: AVAudioFile?
+    private var systemAudioFile: AVAudioFile?
+    
     private let audioQueue = DispatchQueue(label: "com.aura.audioQueue")
     
     override init() {
@@ -35,6 +42,156 @@ class CaptureManager: NSObject, ObservableObject, SCStreamDelegate, SCStreamOutp
             await initialPermissionCheck()
             await findAvailableMics()
         }
+    }
+    
+    @MainActor
+    func startCapture(for meeting: Meeting) {
+        guard !isRecording, hasMicrophoneAccess, hasScreenCaptureAccess else { return }
+        let micToUse = self.selectedMicID
+        Task {
+            do {
+                self.availableContent = try await SCShareableContent.current
+                try self.setupDualStreamRecording(for: meeting, micID: micToUse)
+                
+                try self.micAudioEngine?.start()
+                try self.stream?.startCapture { error in
+                    if let error = error {
+                        print("System capture error: \(error.localizedDescription)")
+                        Task { @MainActor in self.stopCapture() }
+                    }
+                }
+                self.isRecording = true
+                self.recordingMeetingTitle = meeting.title
+                print("--- DUAL STREAM CAPTURE STARTED for \(meeting.title) ---")
+            } catch {
+                print("ERROR during capture setup: \(error.localizedDescription)")
+                self.stopCapture()
+            }
+        }
+    }
+
+    @MainActor
+    func stopCapture() {
+        guard isRecording else { return }
+        print("--- STOPPING DUAL STREAM CAPTURE ---")
+        isRecording = false
+        recordingMeetingTitle = nil
+        
+        micAudioEngine?.stop(); micAudioEngine = nil
+        stream?.stopCapture { _ in }
+        stream = nil
+        
+        micAudioFile = nil
+        systemAudioFile = nil
+        
+        Task(priority: .userInitiated) {
+            await mergeConvertAndUpload()
+        }
+    }
+    
+    private func setupDualStreamRecording(for meeting: Meeting, micID: AudioDeviceID?) throws {
+        let fileManager = FileManager.default
+        let tempDir = fileManager.temporaryDirectory
+        let baseName = "Aura-Rec-\(UUID().uuidString)"
+        tempMicURL = tempDir.appendingPathComponent(baseName + "-mic.caf")
+        tempSystemURL = tempDir.appendingPathComponent(baseName + "-system.caf")
+        finalOutputURL = fileManager.urls(for: .documentDirectory, in: .userDomainMask)[0].appendingPathComponent(sanitize(meeting.title) + "_\(Date().formatted(.iso8601)).m4a")
+        
+        // --- Setup Microphone ---
+        micAudioEngine = AVAudioEngine()
+        let engine = micAudioEngine!
+        let inputNode = engine.inputNode
+        guard var micToUseID = micID, let audioUnit = inputNode.audioUnit else { throw NSError(domain: "Aura", code: 1, userInfo: [NSLocalizedDescriptionKey: "Mic setup failed."]) }
+        var propertyAddress = AudioObjectPropertyAddress(mSelector: kAudioOutputUnitProperty_CurrentDevice, mScope: kAudioUnitScope_Global, mElement: 0)
+        let status = AudioUnitSetProperty(audioUnit, propertyAddress.mSelector, propertyAddress.mScope, propertyAddress.mElement, &micToUseID, UInt32(MemoryLayout<AudioDeviceID>.size))
+        guard status == noErr else { throw NSError(domain: "Aura", code: 2, userInfo: [NSLocalizedDescriptionKey: "Failed to set mic with status \(status)."]) }
+        
+        let micFormat = inputNode.outputFormat(forBus: 0)
+        micAudioFile = try AVAudioFile(forWriting: tempMicURL!, settings: micFormat.settings, commonFormat: .pcmFormatFloat32, interleaved: false)
+        inputNode.installTap(onBus: 0, bufferSize: 4096, format: micFormat) { [weak self] (buffer, time) in
+            try? self?.micAudioFile?.write(from: buffer)
+        }
+        
+        // --- Setup System Audio ---
+        guard let display = availableContent?.displays.first else { throw NSError(domain: "Aura", code: 3, userInfo: [NSLocalizedDescriptionKey: "No display found."]) }
+        let filter = SCContentFilter(display: display, excludingApplications: [], exceptingWindows: [])
+        let config = SCStreamConfiguration(); config.capturesAudio = true; config.excludesCurrentProcessAudio = true
+        stream = SCStream(filter: filter, configuration: config, delegate: self)
+        
+        let systemAudioSettings = [AVFormatIDKey: kAudioFormatLinearPCM, AVLinearPCMIsFloatKey: true, AVSampleRateKey: 48000, AVNumberOfChannelsKey: 2] as [String : Any]
+        let systemAudioFormat = AVAudioFormat(settings: systemAudioSettings)!
+        systemAudioFile = try AVAudioFile(forWriting: tempSystemURL!, settings: systemAudioFormat.settings, commonFormat: .pcmFormatFloat32, interleaved: false)
+        try stream?.addStreamOutput(self, type: .audio, sampleHandlerQueue: audioQueue)
+    }
+    
+    @MainActor
+    private func mergeConvertAndUpload() async {
+        guard let micURL = tempMicURL, let systemURL = tempSystemURL, let finalURL = finalOutputURL else {
+            print("Missing audio URLs for conversion.")
+            return
+        }
+        
+        print("Starting merge and conversion...")
+        
+        let composition = AVMutableComposition()
+        
+        do {
+            let micAsset = AVURLAsset(url: micURL)
+            if let micTrack = try await micAsset.loadTracks(withMediaType: .audio).first {
+                let compositionTrack = composition.addMutableTrack(withMediaType: .audio, preferredTrackID: kCMPersistentTrackID_Invalid)
+                try compositionTrack?.insertTimeRange(CMTimeRange(start: .zero, duration: await micAsset.load(.duration)), of: micTrack, at: .zero)
+            }
+            
+            let systemAsset = AVURLAsset(url: systemURL)
+            if let systemTrack = try await systemAsset.loadTracks(withMediaType: .audio).first {
+                let compositionTrack = composition.addMutableTrack(withMediaType: .audio, preferredTrackID: kCMPersistentTrackID_Invalid)
+                try compositionTrack?.insertTimeRange(CMTimeRange(start: .zero, duration: await systemAsset.load(.duration)), of: systemTrack, at: .zero)
+            }
+
+            guard let exportSession = AVAssetExportSession(asset: composition, presetName: AVAssetExportPresetAppleM4A) else { return }
+            exportSession.outputURL = finalURL
+            exportSession.outputFileType = .m4a
+            
+            await exportSession.export()
+            
+            if exportSession.status == .completed {
+                print("Merge and conversion successful.")
+                await uploadRecording(fileURL: finalURL)
+            } else {
+                print("Merge/Conversion failed: \(exportSession.error?.localizedDescription ?? "Unknown")")
+            }
+        } catch {
+            print("Error during asset loading/composition: \(error)")
+        }
+        
+        try? FileManager.default.removeItem(at: micURL)
+        try? FileManager.default.removeItem(at: systemURL)
+    }
+
+    @MainActor
+    private func uploadRecording(fileURL: URL) async {
+        print("Starting upload for \(fileURL.lastPathComponent)")
+        do {
+            let session = try await supabase.auth.session
+            let fileData = try Data(contentsOf: fileURL)
+            let fileName = fileURL.lastPathComponent
+            _ = try await supabase.storage
+                .from("recordings")
+                .upload(path: "\(session.user.id)/\(fileName)", file: fileData)
+            print("✅ Upload completed successfully!")
+            try? FileManager.default.removeItem(at: fileURL)
+        } catch {
+            print("❌ Upload failed: \(error.localizedDescription)")
+        }
+    }
+    
+    func stream(_ stream: SCStream, didOutputSampleBuffer sampleBuffer: CMSampleBuffer, of type: SCStreamOutputType) {
+        guard type == .audio, let pcmBuffer = try? sampleBuffer.toPCMBuffer() else { return }
+        try? self.systemAudioFile?.write(from: pcmBuffer)
+    }
+    
+    private func sanitize(_ text: String) -> String {
+        return text.replacingOccurrences(of: "[^a-zA-Z0-9]+", with: "_", options: .regularExpression)
     }
     
     @MainActor
@@ -92,182 +249,48 @@ class CaptureManager: NSObject, ObservableObject, SCStreamDelegate, SCStreamOutp
             self.hasScreenCaptureAccess = false
         }
     }
-
-    @MainActor
-    func startCapture(for meeting: Meeting) {
-        guard !isRecording, hasMicrophoneAccess, hasScreenCaptureAccess else { return }
-        
-        let micToUse = self.selectedMicID
-        
-        Task {
-            do {
-                self.availableContent = try await SCShareableContent.current
-                
-                try self.setupAudioSession(for: meeting, micID: micToUse)
-                
-                try self.micAudioEngine?.start()
-                try self.stream?.startCapture { error in
-                    if let error = error {
-                        print("System capture error: \(error.localizedDescription)")
-                        Task { @MainActor in self.stopCapture() }
-                    }
-                }
-
-                self.isRecording = true
-                self.recordingMeetingTitle = meeting.title
-                print("--- CAPTURE STARTED for \(meeting.title) ---")
-                
-            } catch {
-                print("ERROR during capture setup: \(error.localizedDescription)")
-                self.stopCapture()
-            }
-        }
-    }
-    
-    private func setupAudioSession(for meeting: Meeting, micID: AudioDeviceID?) throws {
-        let outputURL = createFileURL(for: meeting.title)
-        assetWriter = try AVAssetWriter(url: outputURL, fileType: .m4a)
-        
-        try setupMicInput(micID: micID)
-        setupSystemAudioInput()
-        
-        guard let writer = assetWriter, writer.startWriting() else {
-            throw NSError(domain: "Aura", code: 99, userInfo: [NSLocalizedDescriptionKey: "AssetWriter could not start writing."])
-        }
-        
-        sessionStartTime = CMTime(seconds: CACurrentMediaTime(), preferredTimescale: 1000000)
-        writer.startSession(atSourceTime: .zero)
-    }
-
-    @MainActor
-    func stopCapture() {
-        guard isRecording else { return }
-        print("--- STOPPING CAPTURE ---")
-        
-        isRecording = false
-        recordingMeetingTitle = nil
-        
-        micAudioEngine?.stop(); micAudioEngine = nil
-        stream?.stopCapture { _ in }
-        stream = nil
-        
-        micAudioInput?.markAsFinished()
-        systemAudioInput?.markAsFinished()
-        
-        Task(priority: .userInitiated) {
-            await self.assetWriter?.finishWriting()
-            guard self.assetWriter?.status == .completed else {
-                print("File saving failed: \(self.assetWriter?.error?.localizedDescription ?? "no error")")
-                self.assetWriter = nil
-                return
-            }
-            print("File saved successfully locally.")
-            await self.uploadRecording()
-            self.assetWriter = nil
-        }
-    }
-    
-    @MainActor
-    private func uploadRecording() async {
-        guard let fileURL = lastOutputFileURL else { return }
-        print("Starting upload for \(fileURL.lastPathComponent)")
-        do {
-            let session = try await supabase.auth.session
-            let fileData = try Data(contentsOf: fileURL)
-            let fileName = fileURL.lastPathComponent
-            print("Uploading to Supabase Storage...")
-            _ = try await supabase.storage
-                .from("recordings")
-                .upload(path: "\(session.user.id)/\(fileName)", file: fileData)
-            print("✅ Upload completed successfully!")
-            try? FileManager.default.removeItem(at: fileURL)
-        } catch {
-            print("❌ Upload failed: \(error.localizedDescription)")
-        }
-    }
-    
-    private func createFileURL(for meetingTitle: String) -> URL {
-        let fileManager = FileManager.default
-        let documentsDirectory = fileManager.urls(for: .documentDirectory, in: .userDomainMask)[0]
-        let dateFormatter = DateFormatter(); dateFormatter.dateFormat = "yyyy-MM-dd_HH-mm-ss"
-        let dateString = dateFormatter.string(from: Date())
-        let sanitizedTitle = meetingTitle.replacingOccurrences(of: "[^a-zA-Z0-9]+", with: "_", options: .regularExpression)
-        let fileName = "Aura-Recording_\(sanitizedTitle)_\(dateString).m4a"
-        let url = documentsDirectory.appendingPathComponent(fileName)
-        self.lastOutputFileURL = url
-        return url
-    }
-
-    private func setupMicInput(micID: AudioDeviceID?) throws {
-        micAudioEngine = AVAudioEngine()
-        let engine = micAudioEngine!
-        let inputNode = engine.inputNode
-        guard var micToUseID = micID else {
-            throw NSError(domain: "Aura", code: 1, userInfo: [NSLocalizedDescriptionKey: "No mic selected."])
-        }
-        var propertyAddress = AudioObjectPropertyAddress(mSelector: kAudioOutputUnitProperty_CurrentDevice, mScope: kAudioUnitScope_Global, mElement: 0)
-        let status = AudioUnitSetProperty(inputNode.audioUnit!, propertyAddress.mSelector, propertyAddress.mScope, propertyAddress.mElement, &micToUseID, UInt32(MemoryLayout<AudioDeviceID>.size))
-        guard status == noErr else {
-            throw NSError(domain: "Aura", code: 2, userInfo: [NSLocalizedDescriptionKey: "Failed to set mic with status \(status)."])
-        }
-        let format = inputNode.outputFormat(forBus: 0)
-        let audioSettings: [String: Any] = [AVFormatIDKey: kAudioFormatMPEG4AAC, AVSampleRateKey: format.sampleRate, AVNumberOfChannelsKey: format.channelCount, AVEncoderAudioQualityKey: AVAudioQuality.high.rawValue]
-        micAudioInput = AVAssetWriterInput(mediaType: .audio, outputSettings: audioSettings)
-        micAudioInput?.expectsMediaDataInRealTime = true
-        if let writer = assetWriter, writer.canAdd(micAudioInput!) {
-            writer.add(micAudioInput!)
-        }
-        inputNode.installTap(onBus: 0, bufferSize: 1024, format: format) { [weak self] (buffer, time) in
-            guard let self = self, let micInput = self.micAudioInput, micInput.isReadyForMoreMediaData else { return }
-            if let sampleBuffer = self.createSampleBuffer(from: buffer, timestamp: time) {
-                self.audioQueue.async { micInput.append(sampleBuffer) }
-            }
-        }
-    }
-    
-    private func setupSystemAudioInput() {
-        guard let display = availableContent?.displays.first else { return }
-        let filter = SCContentFilter(display: display, excludingApplications: [], exceptingWindows: [])
-        let config = SCStreamConfiguration(); config.capturesAudio = true; config.excludesCurrentProcessAudio = true
-        let audioSettings: [String: Any] = [AVFormatIDKey: kAudioFormatMPEG4AAC, AVSampleRateKey: 48000, AVNumberOfChannelsKey: 2, AVEncoderAudioQualityKey: AVAudioQuality.high.rawValue]
-        systemAudioInput = AVAssetWriterInput(mediaType: .audio, outputSettings: audioSettings)
-        systemAudioInput?.expectsMediaDataInRealTime = true
-        if let writer = assetWriter, writer.canAdd(systemAudioInput!) {
-            writer.add(systemAudioInput!)
-        }
-        stream = SCStream(filter: filter, configuration: config, delegate: self)
-        do {
-            try stream?.addStreamOutput(self, type: .audio, sampleHandlerQueue: audioQueue)
-        } catch { print("Error setting up system audio stream: \(error.localizedDescription)") }
-    }
-    
-    private func createSampleBuffer(from pcmBuffer: AVAudioPCMBuffer, timestamp: AVAudioTime) -> CMSampleBuffer? {
-        var sampleBuffer: CMSampleBuffer?
-        var format: CMFormatDescription?
-        var timebase: CMTimebase?
-        CMTimebaseCreateWithSourceClock(allocator: kCFAllocatorDefault, sourceClock: CMClockGetHostTimeClock(), timebaseOut: &timebase)
-        CMAudioFormatDescriptionCreate(allocator: kCFAllocatorDefault, asbd: pcmBuffer.format.streamDescription, layoutSize: 0, layout: nil, magicCookieSize: 0, magicCookie: nil, extensions: nil, formatDescriptionOut: &format)
-        let presentationTime = CMTime(seconds: CACurrentMediaTime(), preferredTimescale: 1000000) - (sessionStartTime ?? CMTime.zero)
-        let sampleCount = CMItemCount(pcmBuffer.frameLength)
-        var timing = CMSampleTimingInfo(duration: CMTime(value: 1, timescale: Int32(pcmBuffer.format.sampleRate)), presentationTimeStamp: presentationTime, decodeTimeStamp: .invalid)
-        let status = CMSampleBufferCreateReady(allocator: kCFAllocatorDefault, dataBuffer: nil, formatDescription: format, sampleCount: sampleCount, sampleTimingEntryCount: 1, sampleTimingArray: &timing, sampleSizeEntryCount: 0, sampleSizeArray: nil, sampleBufferOut: &sampleBuffer)
-        guard status == noErr, let buffer = sampleBuffer else { return nil }
-        let error = CMSampleBufferSetDataBufferFromAudioBufferList(buffer, blockBufferAllocator: kCFAllocatorDefault, blockBufferMemoryAllocator: kCFAllocatorDefault, flags: 0, bufferList: pcmBuffer.audioBufferList)
-        guard error == noErr else { return nil }
-        return buffer
-    }
-    
-    func stream(_ stream: SCStream, didOutputSampleBuffer sampleBuffer: CMSampleBuffer, of type: SCStreamOutputType) {
-        guard type == .audio, sampleBuffer.isValid else { return }
-        if let input = self.systemAudioInput, input.isReadyForMoreMediaData {
-            input.append(sampleBuffer)
-        }
-    }
     
     func stream(_ stream: SCStream, didStopWithError error: Error) {
         print("System audio stream stopped with error: \(error.localizedDescription)")
         Task { @MainActor in
             if self.isRecording { self.stopCapture() }
         }
+    }
+}
+
+extension CMSampleBuffer {
+    func toPCMBuffer() throws -> AVAudioPCMBuffer {
+        guard let blockBuffer = self.dataBuffer else {
+            throw NSError(domain: "Aura", code: 8, userInfo: [NSLocalizedDescriptionKey: "Missing data buffer."])
+        }
+
+        var audioBufferList = AudioBufferList()
+        var blockBufferLength: Int = 0
+        var dataPointer: UnsafeMutablePointer<Int8>?
+
+        // Extract audio samples from CMBlockBuffer
+        let status = CMBlockBufferGetDataPointer(blockBuffer,
+                                                 atOffset: 0,
+                                                 lengthAtOffsetOut: nil,
+                                                 totalLengthOut: &blockBufferLength,
+                                                 dataPointerOut: &dataPointer)
+        guard status == noErr, let pointer = dataPointer else {
+            throw NSError(domain: "Aura", code: 9, userInfo: [NSLocalizedDescriptionKey: "Failed to get data pointer."])
+        }
+
+        guard let formatDescription = self.formatDescription else {
+            throw NSError(domain: "Aura", code: 10, userInfo: [NSLocalizedDescriptionKey: "Failed to get format description."])
+        }
+
+        let audioFormat = AVAudioFormat(cmAudioFormatDescription: formatDescription)
+        guard let pcmBuffer = AVAudioPCMBuffer(pcmFormat: audioFormat,
+                                               frameCapacity: AVAudioFrameCount(self.numSamples)) else {
+            throw NSError(domain: "Aura", code: 11, userInfo: [NSLocalizedDescriptionKey: "Failed to create AVAudioPCMBuffer."])
+        }
+
+        pcmBuffer.frameLength = pcmBuffer.frameCapacity
+        let dst = pcmBuffer.mutableAudioBufferList.pointee.mBuffers
+        memcpy(dst.mData, pointer, Int(dst.mDataByteSize))
+        return pcmBuffer
     }
 }
