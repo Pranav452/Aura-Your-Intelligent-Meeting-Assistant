@@ -2,47 +2,79 @@
 
 import Foundation
 
-enum NetworkError: Error {
-    case invalidURL
-    case requestFailed(Error)
-    case invalidResponse
-    case unauthorized
-}
-
 class NetworkManager {
-    // We use a singleton so there's only one instance of this manager in the app.
     static let shared = NetworkManager()
-    
-    // Set the base URL for your local backend server.
     private let baseURL = "http://127.0.0.1:8000"
 
-    // This is our test function to verify we can talk to the backend.
+    // This function is required by CaptureManager to test the token
     func verifyUser(token: String) async -> Bool {
         guard let url = URL(string: "\(baseURL)/api/v1/me") else {
-            print("Invalid URL")
+            print("Invalid URL for verifyUser")
             return false
         }
         
         var request = URLRequest(url: url)
         request.httpMethod = "GET"
-        // Add the JWT to the Authorization header.
         request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         
         do {
-            let (data, response) = try await URLSession.shared.data(for: request)
-            
+            let (_, response) = try await URLSession.shared.data(for: request)
             guard let httpResponse = response as? HTTPURLResponse, httpResponse.statusCode == 200 else {
-                print("Invalid response from server.")
                 return false
             }
-            
-            // We successfully received data from the secure endpoint.
-            print("Successfully verified user with backend: \(String(data: data, encoding: .utf8) ?? "")")
             return true
-            
         } catch {
-            print("Network request failed: \(error)")
+            print("Network request failed during verifyUser: \(error)")
             return false
         }
+    }
+
+    // This is the new function to fetch the meeting history
+    func fetchMeetings(token: String) async throws -> [CompletedMeeting] {
+        guard let url = URL(string: "\(baseURL)/api/v1/meetings") else {
+            throw NSError(domain: "AuraNet", code: 0, userInfo: [NSLocalizedDescriptionKey: "Invalid URL"])
+        }
+        
+        var request = URLRequest(url: url)
+        request.httpMethod = "GET"
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        
+        let (data, response) = try await URLSession.shared.data(for: request)
+        
+        guard let httpResponse = response as? HTTPURLResponse, httpResponse.statusCode == 200 else {
+            // It's helpful to print the server's response if it's not 200 OK
+            let errorBody = String(data: data, encoding: .utf8) ?? "No response body"
+            if let res = response as? HTTPURLResponse {
+                print("Invalid server response: \(res.statusCode). Body: \(errorBody)")
+            } else {
+                print("Invalid server response. Body: \(errorBody)")
+            }
+            throw NSError(domain: "AuraNet", code: 1, userInfo: [NSLocalizedDescriptionKey: "Invalid server response"])
+        }
+        
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .custom { decoder -> Date in
+            let container = try decoder.singleValueContainer()
+            let dateString = try container.decode(String.self)
+            
+            let formatters = [
+                "yyyy-MM-dd'T'HH:mm:ss.SSSSSSZ",
+                "yyyy-MM-dd'T'HH:mm:ssZ"
+            ]
+            
+            for format in formatters {
+                let dateFormatter = DateFormatter()
+                dateFormatter.dateFormat = format
+                dateFormatter.locale = Locale(identifier: "en_US_POSIX")
+                dateFormatter.timeZone = TimeZone(secondsFromGMT: 0)
+                if let date = dateFormatter.date(from: dateString) {
+                    return date
+                }
+            }
+            
+            throw DecodingError.dataCorruptedError(in: container, debugDescription: "Cannot decode date string \(dateString)")
+        }
+        
+        return try decoder.decode([CompletedMeeting].self, from: data)
     }
 }

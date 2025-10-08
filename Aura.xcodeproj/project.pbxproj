@@ -43,28 +43,16 @@
 			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
 			membershipExceptions = (
 				Info.plist,
-				MeetingModels.swift,
 			);
 			target = E8E7C6612E938271002FFCBB /* Aura */;
 		};
 /* End PBXFileSystemSynchronizedBuildFileExceptionSet section */
-
-/* Begin PBXFileSystemSynchronizedGroupBuildPhaseMembershipExceptionSet section */
-		E8A7A6492E96A4130063775F /* Exceptions for "Aura" folder in "Copy Bundle Resources" phase from "Aura" target */ = {
-			isa = PBXFileSystemSynchronizedGroupBuildPhaseMembershipExceptionSet;
-			buildPhase = E8E7C6602E938271002FFCBB /* Resources */;
-			membershipExceptions = (
-				MeetingModels.swift,
-			);
-		};
-/* End PBXFileSystemSynchronizedGroupBuildPhaseMembershipExceptionSet section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
 		E8E7C6642E938271002FFCBB /* Aura */ = {
 			isa = PBXFileSystemSynchronizedRootGroup;
 			exceptions = (
 				E8E7C6A22E938A16002FFCBB /* Exceptions for "Aura" folder in "Aura" target */,
-				E8A7A6492E96A4130063775F /* Exceptions for "Aura" folder in "Copy Bundle Resources" phase from "Aura" target */,
 			);
 			path = Aura;
 			sourceTree = "<group>";

@@ -2,97 +2,70 @@
 
 import Foundation
 
-struct CompletedMeeting: Codable, Identifiable {
+struct CompletedMeeting: Codable, Identifiable, Hashable {
     let id: Int
-    let createdAt: Date
+    let createdAt: String
     let title: String
     let summary: String?
-    let transcript: [Utterance]?
+    let transcript: [Utterance]? // We will always decode into an array of Utterances
     let actionItems: [ActionItem]?
 
-    // We need to tell Swift how to map the snake_case names from the database
-    // to our camelCase property names.
     enum CodingKeys: String, CodingKey {
-        case id
+        case id, title, summary, transcript
         case createdAt = "created_at"
-        case title
-        case summary
-        case transcript
         case actionItems = "action_items"
+    }
+    
+    // Custom decoder to handle both dictionary and array for 'transcript'
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(Int.self, forKey: .id)
+        createdAt = try container.decode(String.self, forKey: .createdAt)
+        title = try container.decode(String.self, forKey: .title)
+        summary = try container.decodeIfPresent(String.self, forKey: .summary)
+        actionItems = try container.decodeIfPresent([ActionItem].self, forKey: .actionItems)
+        
+        // This is the robust logic for the transcript
+        if let dict = try? container.decodeIfPresent(TranscriptData.self, forKey: .transcript) {
+            // It's a dictionary like {"full_text": "..."}
+            if let text = dict.fullText {
+                transcript = [Utterance(speaker: "A", text: text)]
+            } else {
+                transcript = []
+            }
+        } else if let array = try? container.decodeIfPresent([Utterance].self, forKey: .transcript) {
+            // It's already an array like [{"speaker": ..., "text": ...}]
+            transcript = array
+        } else {
+            transcript = nil
+        }
     }
 }
 
-struct Utterance: Codable, Hashable {
+// This struct is now just a helper for decoding the dictionary case
+struct TranscriptData: Codable, Hashable {
+    let fullText: String?
+    enum CodingKeys: String, CodingKey {
+        case fullText = "full_text"
+    }
+}
+
+struct Utterance: Codable, Hashable, Identifiable {
+    var id = UUID()
     let speaker: String?
     let text: String
+    
+    enum CodingKeys: String, CodingKey {
+        case speaker, text
+    }
 }
 
 struct ActionItem: Codable, Hashable, Identifiable {
-    // We add a unique ID here so we can use it in SwiftUI Lists.
     var id = UUID()
     let assignee: String?
     let task: String
 
     enum CodingKeys: String, CodingKey {
-        case assignee
-        case task
-    }
-}
-```*(Self-correction: I've added a UUID to `ActionItem` to make it `Identifiable`, which is a best practice for SwiftUI lists.)*
-
-#### **2. Add a `SELECT` Policy in Supabase**
-
-Your `meetings` table is currently protected. No one can read from it. We need to add a Row-Level Security (RLS) policy that says: **"A user can only see their own meetings."**
-
-1.  Go to your Supabase dashboard.
-2.  Navigate to **Authentication > Policies**.
-3.  Find the `meetings` table and click **"New policy"**.
-4.  Select the template **"Enable read access to everyone"**.
-5.  **Change the Policy Name** to `Allow individual read access`.
-6.  **IMPORTANT:** In the `USING expression` box, change `true` to the following condition:
-    ```sql
-    auth.uid() = user_id
-    ```
-7.  Click **"Review"** and **"Save policy"**.
-
-#### **3. Create the `MeetingHistoryViewModel`**
-
-This new class will be responsible for fetching the list of completed meetings from the database.
-
-1.  Create a new **Swift File** named `MeetingHistoryViewModel.swift`.
-2.  Paste the following code into it.
-
-```swift
-// MeetingHistoryViewModel.swift
-
-import Foundation
-
-@MainActor
-class MeetingHistoryViewModel: ObservableObject {
-    @Published var meetings: [CompletedMeeting] = []
-    @Published var isLoading = false
-    @Published var errorMessage: String?
-
-    func fetchMeetings() async {
-        isLoading = true
-        errorMessage = nil
-        
-        do {
-            let meetings: [CompletedMeeting] = try await supabase
-                .from("meetings")
-                .select()
-                // Order by most recent first
-                .order("created_at", ascending: false)
-                .execute()
-                .value
-            
-            self.meetings = meetings
-            print("Successfully fetched \(meetings.count) completed meetings.")
-        } catch {
-            print("❌ Error fetching meetings: \(error.localizedDescription)")
-            self.errorMessage = "Failed to load meeting history."
-        }
-        
-        isLoading = false
+        case assignee, task
     }
 }
